@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections.abc import Mapping
-from typing import Any
+from threading import Event
+from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
@@ -17,15 +17,22 @@ LOGGER = logging.getLogger("normalizer")
 TARGET_BATCH_SIZE = 200
 
 
-def _required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
+class PollingWorker(Protocol):
+    source_table: str
+    target_table: str
+
+    def poll_once(self) -> None: ...
+
+
+def _required_env(name: str, environ: Mapping[str, str]) -> str:
+    value = environ.get(name, "").strip()
     if not value:
         raise ValueError(f"Environment variable {name} is required")
     return value
 
 
-def _supabase_project_url(name: str) -> str:
-    value = _required_env(name)
+def _supabase_project_url(name: str, environ: Mapping[str, str]) -> str:
+    value = _required_env(name, environ)
     parsed = urlsplit(value)
     path = parsed.path.rstrip("/")
 
@@ -39,8 +46,8 @@ def _supabase_project_url(name: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
-def _positive_int(name: str, default: int) -> int:
-    value = int(os.getenv(name, str(default)))
+def _positive_int(name: str, default: int, environ: Mapping[str, str]) -> int:
+    value = int(environ.get(name, str(default)))
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
@@ -116,29 +123,51 @@ class SyncWorker:
         )
 
 
-def build_worker() -> tuple[SyncWorker, int]:
+def build_worker(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[SyncWorker, int]:
+    config = os.environ if environ is None else environ
     source = create_client(
-        _supabase_project_url("SOURCE_SUPABASE_URL"),
-        _required_env("SOURCE_SUPABASE_KEY"),
+        _supabase_project_url("SOURCE_SUPABASE_URL", config),
+        _required_env("SOURCE_SUPABASE_KEY", config),
     )
     target = create_client(
-        _supabase_project_url("TARGET_SUPABASE_URL"),
-        _required_env("TARGET_SUPABASE_KEY"),
+        _supabase_project_url("TARGET_SUPABASE_URL", config),
+        _required_env("TARGET_SUPABASE_KEY", config),
     )
-    source_table = os.getenv("SOURCE_TABLE", "raw_leaks")
+    source_table = config.get("SOURCE_TABLE", "raw_leaks")
     worker = SyncWorker(
         source,
         target,
         source_table=source_table,
-        batch_size=_positive_int("BATCH_SIZE", 500),
-        target_table=os.getenv("TARGET_TABLE", "leaked_data"),
+        batch_size=_positive_int("BATCH_SIZE", 500, config),
+        target_table=config.get("TARGET_TABLE", "leaked_data"),
         defaults={
-            "file_name": os.getenv("DEFAULT_FILE_NAME", source_table),
-            "source_channel": os.getenv("DEFAULT_SOURCE_CHANNEL", source_table),
-            "status": os.getenv("DEFAULT_STATUS", "new"),
+            "file_name": config.get("DEFAULT_FILE_NAME", source_table),
+            "source_channel": config.get("DEFAULT_SOURCE_CHANNEL", source_table),
+            "status": config.get("DEFAULT_STATUS", "new"),
         },
     )
-    return worker, _positive_int("POLL_INTERVAL_SECONDS", 60)
+    return worker, _positive_int("POLL_INTERVAL_SECONDS", 60, config)
+
+
+def run_worker(worker: PollingWorker, interval: int, stop_event: Event) -> None:
+    LOGGER.info(
+        "Starting sync: source=%s target=%s poll_interval=%ss",
+        worker.source_table,
+        worker.target_table,
+        interval,
+    )
+
+    while not stop_event.is_set():
+        try:
+            worker.poll_once()
+        except (PostgrestAPIError, HTTPError):
+            # Keep the in-memory position unchanged so the failed batch is retried.
+            LOGGER.exception("Sync batch failed; it will be retried")
+        if stop_event.wait(interval):
+            break
+    LOGGER.info("Sync stopped")
 
 
 def main() -> None:
@@ -148,17 +177,4 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     worker, interval = build_worker()
-    LOGGER.info(
-        "Starting sync: source=%s target=%s poll_interval=%ss",
-        worker.source_table,
-        worker.target_table,
-        interval,
-    )
-
-    while True:
-        try:
-            worker.poll_once()
-        except (PostgrestAPIError, HTTPError):
-            # Keep the in-memory position unchanged so the failed batch is retried.
-            LOGGER.exception("Sync batch failed; it will be retried")
-        time.sleep(interval)
+    run_worker(worker, interval, Event())
